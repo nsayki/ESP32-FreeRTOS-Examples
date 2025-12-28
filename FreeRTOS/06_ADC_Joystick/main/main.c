@@ -117,7 +117,7 @@ void controller_task(void *pvParameters)
             //.. Let's give a tolerance (deadzone): 1500 to 2500.
             const char* direction_x = "MIDDLE";
             const char* direction_y = "MIDDLE";
-            const char* button_state = "RELEASED";
+            const char* button_state = "\033[1;32mRELEASED\033[0m";
 
             // The decision is based on the raw data of X
             if (received_data.x_raw > RIGHT_VALUE) direction_x = "RIGHT";
