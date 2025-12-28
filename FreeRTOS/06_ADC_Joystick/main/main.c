@@ -1,4 +1,21 @@
+/**
+ * @file main.c
+ * @brief ESP32-C6 Joystick Driver with FreeRTOS & ADC OneShot
+ *
+ * This driver implements a thread-safe, producer-consumer model for reading 
+ * analog joysticks. It supports both 8-way directional logic and advanced 
+ * 360-degree trigonometric calculations with auto-calibration.
+ *
+ * @author Nurullah SAYKI
+ * @contact nurullahsayki52@gmail.com
+ * @date 2025-12-28
+ * @version 1.0
+ *
+ * @copyright Copyright (c) 2025
+ * */
+
 #include <stdio.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -8,6 +25,22 @@
 
 
 // --- CONFIGURATION ---
+//.. ENABLE_360_LOGIC == 0 --> Classic 8 Direction
+//.. ENABLE_360_LOGIC ==1 --> Professional 360 Degree
+#define ENABLE_360_LOGIC     1
+
+// CALIBRATION NOTE:
+// Theoretical ADC radius is 2048 (4095/2). However, due to
+// mechanical limitations and hardware offset, the joystick
+// physically maxes out around ~3800 raw value.
+//
+// Since our calibrated center is ~2400:
+// Effective Range = Max(3800) - Center(2400) = ~1400.
+//
+// We use 1400.0f instead of 2048.0f to ensure the calculated
+// power can reach 100% at full stick deflection.
+#define JOYSTICK_MAX_RADIUS  1400.0f
+
 // ESP32-c6 --> GPIO 2 --> ADC1 Channel 2
 // ESP32-c6 --> GPIO 3 --> ADC1 Channel 3
 // ESP32-c6 --> GPIO 4 --> Joystick Switch
@@ -99,7 +132,7 @@ void adc_reader_task(void *pvParameters)
 }
 
 // -------------------------------------------------------------------------
-// Consumer Task
+// Consumer Task (Hybrid: 8-Way & 360-Degree Support)
 // -------------------------------------------------------------------------
 void controller_task(void *pvParameters)
 {
@@ -107,17 +140,90 @@ void controller_task(void *pvParameters)
     printf("\033[2J");
     joystick_data_t received_data;
 
+    // --- CALIBRATION VARIABLES ---
+    static bool is_calibrated = false;
+    static int origin_x = 2048; // Default theoretical center
+    static int origin_y = 2048;
+
     while (1)
     {
         //.. Wait for data from Queue
-        if (xQueueReceive(xJoystickQueue, &received_data, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(xJoystickQueue, &received_data, portMAX_DELAY) == pdTRUE) 
+        {
             
+            //..AUTO-CALIBRATION (Runs only once at startup)
+            if (!is_calibrated) 
+            {
+                origin_x = received_data.x_raw;
+                origin_y = received_data.y_raw;
+                is_calibrated = true;
+                ESP_LOGI("JOYSTICK", "Calibrated Center -> X:%d Y:%d", origin_x, origin_y);
+            }
+
+            //.. Take cursor to the top
+            printf("\033[H"); 
+            printf("-----------------------------\n");
+            #if ENABLE_360_LOGIC
+            printf("  JOYSTICK DRIVER (360 Mode)\n");
+            printf("-----------------------------\n");
+
+            //.. Centering, using the CALIBRATED origin (Not 2048)
+            float x_centered = (float)received_data.x_raw - (float)origin_x;
+            float y_centered = (float)received_data.y_raw - (float)origin_y;
+
+            //.. NOTE: If the Y axis is inverted (The value decreases when going up), multiply by -1
+            y_centered = -y_centered; 
+
+            //. Calculate the angle, the atan2 function returns a value between -Pi and +Pi
+            float angle_rad = atan2(y_centered, x_centered);
+            float angle_deg = angle_rad * (180.0f / M_PI);
+
+            //.. Convert negative angles to positive angles (0-360 degrees)
+            if (angle_deg < 0) angle_deg += 360.0f;
+
+            //.. Convert the direction to counter-clockwise
+            angle_deg = 360.0f - angle_deg;
+
+            //.. If the angle is greater than 360 degrees, set it to 0
+            if (angle_deg >= 360.0f) angle_deg = 0.0f;
+
+            //.. Calculate the magnitude, Pisagor: a^2 + b^2 = c^2
+            float magnitude = sqrt(x_centered*x_centered + y_centered*y_centered);
+            
+            //.. Map the power to 0-100%, max radius ~JOYSTICK_MAX_RADIUS
+            int power_percent = (int)((magnitude / JOYSTICK_MAX_RADIUS) * 100.0f);
+            //.. Prevent overflow
+            if (power_percent > 100) power_percent = 100;
+            
+            //.. Deadzone filter, if the power is less than 10%, set it to 0
+            if (power_percent < 10) 
+            {
+                power_percent = 0;
+                angle_deg = 0.0f;
+            }
+
+            //.. Show on screen(CLI)
+            printf("RAW X: %4d  |  RAW Y: %4d\n", received_data.x_raw, received_data.y_raw);
+            printf("ANGLE  : %-6.1f° |  POWER: %%%-3d\n", angle_deg, power_percent);
+            
+            //.. Visual progress bar
+            printf("POWER BAR: [");
+            for(int i=0; i<20; i++) {
+                if (i < (power_percent/5)) printf("#");
+                else printf(".");
+            }
+            printf("]\n");
+
+            #else
+
+            printf("  JOYSTICK DRIVER (8-Way Mode)\n");
+            printf("-----------------------------\n");
+
             //.. Logic is written here
             //.. The joystick approximately gives a value of 2048 on the center.
             //.. Let's give a tolerance (deadzone): 1500 to 2500.
-            const char* direction_x = "MIDDLE";
-            const char* direction_y = "MIDDLE";
-            const char* button_state = "\033[1;32mRELEASED\033[0m";
+            const char* direction_x = "";
+            const char* direction_y = "";
 
             // The decision is based on the raw data of X
             if (received_data.x_raw > RIGHT_VALUE) direction_x = "RIGHT";
@@ -127,20 +233,32 @@ void controller_task(void *pvParameters)
             if (received_data.y_raw > UP_VALUE) direction_y = "UP";
             else if (received_data.y_raw < DOWN_VALUE) direction_y = "DOWN";
 
-            // Button State (Red/Green Effect)
-            if (received_data.btn_pressed) {
-                button_state = "\033[1;31mPRESSED\033[0m";
+            //.. Combine Directions. We use a buffer to combine "UP" and "RIGHT" -> "UP RIGHT"
+            char combined_direction[32]; 
+
+            if (direction_x[0] == '\0' && direction_y[0] == '\0') 
+            {
+                // Both are empty -> CENTER
+                snprintf(combined_direction, sizeof(combined_direction), "CENTER");
+            } 
+            else 
+            {
+                // Combine string: e.g., "UP    RIGHT" or just "DOWN"
+                snprintf(combined_direction, sizeof(combined_direction), "%s %s", direction_y, direction_x);
             }
 
-            //.. Write to Terminal
-            //.. Go Up in Terminal with \033[H
-            printf("\033[H"); 
-            printf("-----------------------------\n");
-            printf("🕹️  JOYSTICK STATUS (FreeRTOS)\n");
-            printf("-----------------------------\n");
-            printf("RAW X: %4d  |  DIRECTION: %-12s\n", received_data.x_raw, direction_x);
-            printf("RAW Y: %4d  |  DIRECTION: %-12s\n", received_data.y_raw, direction_y);
-            printf("BUTTON   : %-20s\n", button_state);
+            printf("RAW X: %4d  |\n", received_data.x_raw);
+            printf("RAW Y: %4d  |\n", received_data.y_raw);
+            printf("STATUS: %-25s\n", combined_direction);
+            #endif
+
+            const char* button_state = "\033[1;32mRELEASED\033[0m";
+            // Button State (Red/Green Effect)
+            if (received_data.btn_pressed) 
+            {
+                button_state = "\033[1;31mPRESSED\033[0m";
+            }
+            printf("BUTTON: %-25s\n", button_state);
             printf("-----------------------------\n");
         }
     }
